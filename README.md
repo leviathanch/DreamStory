@@ -1,6 +1,6 @@
 # DreamStory Project
 
-This repository is the **official implementation** of [DreamStory](https://arxiv.org/abs/2407.12899) and [IR-Diffusion](https://arxiv.org/abs/2411.19261).  
+This repository is the **official implementation** of [DreamStory (TPAMI 2025)](https://ieeexplore.ieee.org/document/11130395) and [IR-Diffusion](https://arxiv.org/abs/2411.19261).  
 
 
 # Installation
@@ -42,9 +42,13 @@ The generated image will be saved as ./results/example_debug/output_image_00.png
 }
 
 @article{DreamStory,
-  title={Dreamstory: Open-domain story visualization by llm-guided multi-subject consistent diffusion},
+  title={{DreamStory}: Open-Domain Story Visualization by LLM-Guided Multi-Subject Consistent Diffusion}, 
   author={He, Huiguo and Yang, Huan and Tuo, Zixi and Zhou, Yuan and Wang, Qiuyue and Zhang, Yuhang and Liu, Zeyu and Huang, Wenhao and Chao, Hongyang and Yin, Jian},
-  journal={arXiv preprint arXiv:2407.12899},
-  year={2024}
+  journal={IEEE Transactions on Pattern Analysis and Machine Intelligence}, 
+  year={2025},
+  volume={47},
+  number={12},
+  pages={11874-11891},
+  doi={10.1109/TPAMI.2025.3600149}
 }
 ```
