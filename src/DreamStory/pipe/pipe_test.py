@@ -10,6 +10,7 @@ from diffusers import DiffusionPipeline
 
 # load model API
 from DreamStory.attention_processor import get_attn_processor_by_name
+from DreamStory.pipe.DreamStoryPipeline import DreamStoryPipeline
 from DreamStory.gen_mask.dino_sam_mask_generator import load_model, generate_sam_mask, post_process_sam_mask
 from DreamStory.utils.tools import read_test_prompts, set_attn_processors, get_word_token_idx, save_mask
 
@@ -21,9 +22,11 @@ for logger in loggers: # suppress transformers logging
         logger.setLevel(logging.ERROR)
 
 
-def get_model(model, device):
+def get_model(model, device, use_kv_cache=False):
     if isinstance(model, str):
-        model = DiffusionPipeline.from_pretrained(model)
+        # Always use DreamStoryPipeline to ensure consistent RNG consumption
+        # across use_kv_cache=True/False modes (identical __call__ path for rehearsal steps)
+        model = DreamStoryPipeline.from_pretrained(model)
         model = model.to(device).to(torch.bfloat16)
     return model
 
@@ -38,12 +41,13 @@ def test(prompts_path="./results/examples/example_dog_boy.json",
         is_spatial_self_attn=True, is_mutual_cross_attn=True, is_dropout_ca=False,
         is_rescale_self_attn=True, is_isolate_sa=True,
         is_DIFT=False, sam_step=50, style="",
-        attn_processor_name="DreamStoryScaledAttnProcessor", 
-        groundingdino_model=None, sam_predictor=None, sam_name="sam", 
+        attn_processor_name="DreamStoryScaledAttnProcessor",
+        groundingdino_model=None, sam_predictor=None, sam_name="sam",
         is_expand_small_mask=True, is_keep_mask_ratio=False, is_no_mask_overlap=True, is_morphology_mask=True,
         is_overwrite=False, retry_num=20, is_output_mask=False,
+        use_kv_cache=False,
     ):
-    pipe = get_model(model, device)  if isinstance(model, str) else model
+    pipe = get_model(model, device, use_kv_cache=use_kv_cache)  if isinstance(model, str) else model
     test_dict = read_test_prompts(prompts_path, pipe)
 
     os.makedirs(output_root, exist_ok=True)
@@ -244,6 +248,7 @@ def test(prompts_path="./results/examples/example_dog_boy.json",
                     mutual_cross_attention_lambda=mutual_cross_attention_lambda, 
                     is_dropout_ca=is_dropout_ca, ref_sa_lambda=ref_sa_lambda,
                     is_DIFT=is_DIFT, is_output_mask=is_output_mask,
+                    use_kv_cache=use_kv_cache,
                     )
             )
 
@@ -251,7 +256,8 @@ def test(prompts_path="./results/examples/example_dog_boy.json",
         Story_images = pipe(
             prompt=test_prompts, width=width, height=height, guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps, num_images_per_prompt=1,
-            latents=final_consis_start_code, 
+            latents=final_consis_start_code,
+            use_kv_cache=use_kv_cache,
             # TODO: sam_mask=sam_mask, sam_step=sam_step, is_DIFT=is_DIFT,
         ).images
 

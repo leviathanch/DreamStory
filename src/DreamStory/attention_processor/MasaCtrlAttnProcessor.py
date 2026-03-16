@@ -78,17 +78,59 @@ class MasaCtrlAttnProcessor:
         self.gaussian_filter_kernel = torchvision.transforms.GaussianBlur(kernel_size=self.filter_kernel, sigma=0.5)
         # self.mean_filter_kernel = torch.ones((1, 1, self.filter_kernel, self.filter_kernel)) / (self.filter_kernel ** 2)
 
+        # KV-Cache: split reference and scene passes to reduce peak VRAM
+        self.use_kv_cache = kwargs.pop('use_kv_cache', False)
+        self._is_reference_pass = False      # True = reference pass, False = scene pass
+        self._kv_cache = {}                  # {layer_idx: {key, value, ...}}
+        self._ref_pass_layer_counter = 0     # independent layer counter for reference pass
+
         if len(kwargs) > 0:
             print(f"Warning: get unexpected parameters: {kwargs}")
+
+    # --- KV-Cache management methods ---
+    def set_reference_pass(self, is_reference):
+        """Switch between reference pass and scene pass, reset ref layer counter."""
+        self._is_reference_pass = is_reference
+        self._ref_pass_layer_counter = 0
+
+    def clear_kv_cache(self):
+        """Clear all cached KV data for this denoising step."""
+        self._kv_cache = {}
+
+    def _current_layer_idx(self):
+        """Return the current layer index depending on pass mode."""
+        if self.use_kv_cache and self._is_reference_pass:
+            return self._ref_pass_layer_counter
+        return self.cur_att_layer
+
+    def _cache_kv(self, layer_idx, **data):
+        """Store KV cache for a given layer."""
+        if layer_idx not in self._kv_cache:
+            self._kv_cache[layer_idx] = {}
+        self._kv_cache[layer_idx].update(data)
+
+    def _get_cached(self, layer_idx):
+        """Retrieve cached KV data for a given layer."""
+        return self._kv_cache.get(layer_idx, {})
 
     def reset(self):
         self.cur_step = 0
         self.cur_att_layer = 0
+        self._ref_pass_layer_counter = 0
+        self._kv_cache = {}
+        self._is_reference_pass = False
     
     def reset_mask_dict(self):
         self.mask_dict = {}
     
     def after_step(self): # update after each attention layer
+        if self.use_kv_cache and self._is_reference_pass:
+            # Reference pass: only increment ref layer counter, do NOT advance cur_step
+            self._ref_pass_layer_counter += 1
+            if self._ref_pass_layer_counter == self.total_attn_layers:
+                self._ref_pass_layer_counter = 0
+            return
+
         self.cur_att_layer += 1
         if self.cur_att_layer == self.total_attn_layers:
             self.cur_att_layer = 0
@@ -254,70 +296,134 @@ class MasaCtrlAttnProcessor:
             
         # apply MasaCtrl
         if not is_cross_attention and self.cur_step in self.step_idx_list and self.cur_att_layer // 2 in self.self_attn_layer_idx_list:
-            query_unconditional, query_conditional = query.chunk(2, dim=0)
-            key_unconditional, key_conditional = key.chunk(2, dim=0)
-            value_unconditional, value_conditional = value.chunk(2, dim=0)
-            attention_probs_unconditional, attention_probs_conditional = attention_probs.chunk(2, dim=0)
 
-            query_unconditional_source, query_unconditional_target = query_unconditional.chunk(2, dim=0)
-            key_unconditional_source, key_unconditional_target = key_unconditional.chunk(2, dim=0)
-            value_unconditional_source, value_unconditional_target = value_unconditional.chunk(2, dim=0)
-            attention_probs_unconditional_source, attention_probs_unconditional_target = attention_probs_unconditional.chunk(2, dim=0)
+            if self.use_kv_cache and self._is_reference_pass:
+                # === Reference pass: source only, cache K/V ===
+                layer_idx = self._current_layer_idx()
+                query_unconditional, query_conditional = query.chunk(2, dim=0)
+                key_unconditional, key_conditional = key.chunk(2, dim=0)
+                value_unconditional, value_conditional = value.chunk(2, dim=0)
+                attention_probs_unconditional, attention_probs_conditional = attention_probs.chunk(2, dim=0)
 
-            query_conditional_source, query_conditional_target = query_conditional.chunk(2, dim=0)
-            key_conditional_source, key_conditional_target = key_conditional.chunk(2, dim=0)
-            value_conditional_source, value_conditional_target = value_conditional.chunk(2, dim=0)
-            attention_probs_conditional_source, attention_probs_conditional_target = attention_probs_conditional.chunk(2, dim=0)
+                hidden_states_unconditional_source = torch.bmm(attention_probs_unconditional, value_unconditional)
+                hidden_states_unconditional_source = attn.batch_to_head_dim(hidden_states_unconditional_source)
+                hidden_states_conditional_source = torch.bmm(attention_probs_conditional, value_conditional)
+                hidden_states_conditional_source = attn.batch_to_head_dim(hidden_states_conditional_source)
 
-            # source image
-            hidden_states_unconditional_source = torch.bmm(attention_probs_unconditional_source, value_unconditional_source)
-            hidden_states_unconditional_source = attn.batch_to_head_dim(hidden_states_unconditional_source)
-            hidden_states_conditional_source = torch.bmm(attention_probs_conditional_source, value_conditional_source)
-            hidden_states_conditional_source = attn.batch_to_head_dim(hidden_states_conditional_source)
+                self._cache_kv(layer_idx,
+                    sa_key_uncond=key_unconditional,
+                    sa_value_uncond=value_unconditional,
+                    sa_key_cond=key_conditional,
+                    sa_value_cond=value_conditional,
+                )
 
-            # get mask
-            mask = self.aggregate_cross_attn_map(idx=self.ref_token_idx)  # (2, H, W)? SD-XL: (torch.Size([4, 24, 40]))
-            mask_source = mask[-2]  # (H, W) source image mask
-            mask = self.aggregate_cross_attn_map(idx=self.cur_token_idx)  # (2, H, W)? SD-XL: (torch.Size([4, 24, 40]))
-            mask_target = mask[-1]  # (H, W) target image mask
+                hidden_states = torch.cat([hidden_states_unconditional_source, hidden_states_conditional_source], dim=0)
 
-            scale_ratio = (self.latents_shape[0] * self.latents_shape[1] // query.shape[1]) ** 0.5
-            mask_h, mask_w = int(self.latents_shape[0] // scale_ratio), int(self.latents_shape[1] // scale_ratio) # assume the shape of mask_target is the same as the mask_source
-            # F.interpolate do not support bfloat16, transfer to float
-            self_attns_mask = F.interpolate(mask_source.unsqueeze(0).unsqueeze(0).to(torch.float), (mask_h, mask_w)).flatten()
-            spatial_mask = F.interpolate(mask_target.unsqueeze(0).unsqueeze(0).to(torch.float), (mask_h, mask_w)).reshape(-1, 1).to(query.device)
+            elif self.use_kv_cache and not self._is_reference_pass:
+                # === Scene pass: target only, use cached source K/V ===
+                layer_idx = self._current_layer_idx()
+                query_unconditional_target, query_conditional_target = query.chunk(2, dim=0)
 
-            # binarize the mask
-            self_attns_mask, spatial_mask = self.binarize_mask(self_attns_mask, spatial_mask)            
+                # get mask
+                mask = self.aggregate_cross_attn_map(idx=self.ref_token_idx)
+                mask_source = mask[-2]
+                mask = self.aggregate_cross_attn_map(idx=self.cur_token_idx)
+                mask_target = mask[-1]
 
-            if self.is_remove_outliers: # remove the outliers
-                self_attns_mask, spatial_mask = self.remove_outliers(self_attns_mask, spatial_mask, query.device, mask_h, mask_w)
+                scale_ratio = (self.latents_shape[0] * self.latents_shape[1] // query.shape[1]) ** 0.5
+                mask_h, mask_w = int(self.latents_shape[0] // scale_ratio), int(self.latents_shape[1] // scale_ratio)
+                self_attns_mask = F.interpolate(mask_source.unsqueeze(0).unsqueeze(0).to(torch.float), (mask_h, mask_w)).flatten()
+                spatial_mask = F.interpolate(mask_target.unsqueeze(0).unsqueeze(0).to(torch.float), (mask_h, mask_w)).reshape(-1, 1).to(query.device)
+                self_attns_mask, spatial_mask = self.binarize_mask(self_attns_mask, spatial_mask)
 
-            self_attns_mask = self_attns_mask.to(query.device).to(query.dtype)
-            spatial_mask = spatial_mask.to(query.device).to(query.dtype)
+                if self.is_remove_outliers:
+                    self_attns_mask, spatial_mask = self.remove_outliers(self_attns_mask, spatial_mask, query.device, mask_h, mask_w)
 
-            # random dropout some tokens to enhance the diversity of the generated images
-            if self.dropout > 0:
-                dropout_mask = torch.bernoulli(torch.ones_like(self_attns_mask) * (1 - self.dropout))
-                self_attns_mask = self_attns_mask * dropout_mask
-                spatial_mask = spatial_mask * dropout_mask.unsqueeze(-1)
+                self_attns_mask = self_attns_mask.to(query.device).to(query.dtype)
+                spatial_mask = spatial_mask.to(query.device).to(query.dtype)
 
-            hidden_states_unconditional_target = self.mask_attention(query_unconditional_target, key_unconditional_source, value_unconditional_source, 
-                                                                    attn, self_attns_mask)
-            hidden_states_conditional_target = self.mask_attention(query_conditional_target, key_conditional_source, value_conditional_source, 
-                                                                    attn, self_attns_mask)
+                if self.dropout > 0:
+                    dropout_mask = torch.bernoulli(torch.ones_like(self_attns_mask) * (1 - self.dropout))
+                    self_attns_mask = self_attns_mask * dropout_mask
+                    spatial_mask = spatial_mask * dropout_mask.unsqueeze(-1)
 
-            hidden_states_unconditional_target_foreground, hidden_states_unconditional_target_background = hidden_states_unconditional_target.chunk(2)
-            hidden_states_conditional_target_foreground, hidden_states_conditional_target_background = hidden_states_conditional_target.chunk(2)
+                cached = self._get_cached(layer_idx)
 
-            hidden_states_unconditional_target = hidden_states_unconditional_target_foreground * spatial_mask + hidden_states_unconditional_target_background * (1 - spatial_mask)
-            hidden_states_conditional_target = hidden_states_conditional_target_foreground * spatial_mask + hidden_states_conditional_target_background * (1 - spatial_mask)
+                hidden_states_unconditional_target = self.mask_attention(query_unconditional_target, cached['sa_key_uncond'], cached['sa_value_uncond'],
+                                                                        attn, self_attns_mask)
+                hidden_states_conditional_target = self.mask_attention(query_conditional_target, cached['sa_key_cond'], cached['sa_value_cond'],
+                                                                        attn, self_attns_mask)
 
-            hidden_states = torch.cat([hidden_states_unconditional_source, hidden_states_unconditional_target, 
-                                        hidden_states_conditional_source, hidden_states_conditional_target], dim=0)
+                hidden_states_unconditional_target_foreground, hidden_states_unconditional_target_background = hidden_states_unconditional_target.chunk(2)
+                hidden_states_conditional_target_foreground, hidden_states_conditional_target_background = hidden_states_conditional_target.chunk(2)
 
-            del hidden_states_unconditional_source, hidden_states_unconditional_target, hidden_states_conditional_source, hidden_states_conditional_target
-            del hidden_states_unconditional_target_foreground, hidden_states_unconditional_target_background, hidden_states_conditional_target_foreground, hidden_states_conditional_target_background
+                hidden_states_unconditional_target = hidden_states_unconditional_target_foreground * spatial_mask + hidden_states_unconditional_target_background * (1 - spatial_mask)
+                hidden_states_conditional_target = hidden_states_conditional_target_foreground * spatial_mask + hidden_states_conditional_target_background * (1 - spatial_mask)
+
+                hidden_states = torch.cat([hidden_states_unconditional_target, hidden_states_conditional_target], dim=0)
+
+            else:
+                # === Original non-KV-Cache path ===
+                query_unconditional, query_conditional = query.chunk(2, dim=0)
+                key_unconditional, key_conditional = key.chunk(2, dim=0)
+                value_unconditional, value_conditional = value.chunk(2, dim=0)
+                attention_probs_unconditional, attention_probs_conditional = attention_probs.chunk(2, dim=0)
+
+                query_unconditional_source, query_unconditional_target = query_unconditional.chunk(2, dim=0)
+                key_unconditional_source, key_unconditional_target = key_unconditional.chunk(2, dim=0)
+                value_unconditional_source, value_unconditional_target = value_unconditional.chunk(2, dim=0)
+                attention_probs_unconditional_source, attention_probs_unconditional_target = attention_probs_unconditional.chunk(2, dim=0)
+
+                query_conditional_source, query_conditional_target = query_conditional.chunk(2, dim=0)
+                key_conditional_source, key_conditional_target = key_conditional.chunk(2, dim=0)
+                value_conditional_source, value_conditional_target = value_conditional.chunk(2, dim=0)
+                attention_probs_conditional_source, attention_probs_conditional_target = attention_probs_conditional.chunk(2, dim=0)
+
+                # source image
+                hidden_states_unconditional_source = torch.bmm(attention_probs_unconditional_source, value_unconditional_source)
+                hidden_states_unconditional_source = attn.batch_to_head_dim(hidden_states_unconditional_source)
+                hidden_states_conditional_source = torch.bmm(attention_probs_conditional_source, value_conditional_source)
+                hidden_states_conditional_source = attn.batch_to_head_dim(hidden_states_conditional_source)
+
+                # get mask
+                mask = self.aggregate_cross_attn_map(idx=self.ref_token_idx)
+                mask_source = mask[-2]
+                mask = self.aggregate_cross_attn_map(idx=self.cur_token_idx)
+                mask_target = mask[-1]
+
+                scale_ratio = (self.latents_shape[0] * self.latents_shape[1] // query.shape[1]) ** 0.5
+                mask_h, mask_w = int(self.latents_shape[0] // scale_ratio), int(self.latents_shape[1] // scale_ratio)
+                self_attns_mask = F.interpolate(mask_source.unsqueeze(0).unsqueeze(0).to(torch.float), (mask_h, mask_w)).flatten()
+                spatial_mask = F.interpolate(mask_target.unsqueeze(0).unsqueeze(0).to(torch.float), (mask_h, mask_w)).reshape(-1, 1).to(query.device)
+                self_attns_mask, spatial_mask = self.binarize_mask(self_attns_mask, spatial_mask)
+
+                if self.is_remove_outliers:
+                    self_attns_mask, spatial_mask = self.remove_outliers(self_attns_mask, spatial_mask, query.device, mask_h, mask_w)
+
+                self_attns_mask = self_attns_mask.to(query.device).to(query.dtype)
+                spatial_mask = spatial_mask.to(query.device).to(query.dtype)
+
+                if self.dropout > 0:
+                    dropout_mask = torch.bernoulli(torch.ones_like(self_attns_mask) * (1 - self.dropout))
+                    self_attns_mask = self_attns_mask * dropout_mask
+                    spatial_mask = spatial_mask * dropout_mask.unsqueeze(-1)
+
+                hidden_states_unconditional_target = self.mask_attention(query_unconditional_target, key_unconditional_source, value_unconditional_source,
+                                                                        attn, self_attns_mask)
+                hidden_states_conditional_target = self.mask_attention(query_conditional_target, key_conditional_source, value_conditional_source,
+                                                                        attn, self_attns_mask)
+
+                hidden_states_unconditional_target_foreground, hidden_states_unconditional_target_background = hidden_states_unconditional_target.chunk(2)
+                hidden_states_conditional_target_foreground, hidden_states_conditional_target_background = hidden_states_conditional_target.chunk(2)
+
+                hidden_states_unconditional_target = hidden_states_unconditional_target_foreground * spatial_mask + hidden_states_unconditional_target_background * (1 - spatial_mask)
+                hidden_states_conditional_target = hidden_states_conditional_target_foreground * spatial_mask + hidden_states_conditional_target_background * (1 - spatial_mask)
+
+                hidden_states = torch.cat([hidden_states_unconditional_source, hidden_states_unconditional_target,
+                                            hidden_states_conditional_source, hidden_states_conditional_target], dim=0)
+
+                del hidden_states_unconditional_source, hidden_states_unconditional_target, hidden_states_conditional_source, hidden_states_conditional_target
+                del hidden_states_unconditional_target_foreground, hidden_states_unconditional_target_background, hidden_states_conditional_target_foreground, hidden_states_conditional_target_background
 
         else: # standard calculation
             hidden_states = torch.bmm(attention_probs, value)

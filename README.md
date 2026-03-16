@@ -29,6 +29,20 @@ This repository is the **official implementation** of [DreamStory (TPAMI 2025)](
 
 The generated image will be saved as ./results/example_debug/output_image_00.png.
 
+### DreamStory Mode (without Isolation/Reposition)
+- `bash run_DreamStory.sh`
+
+### IR-Diffusion Mode (with Isolation and Reposition Attention)
+- `bash run_IR_Diffusion.sh`
+
+### DreamStory Mode with KV-Cache (memory-efficient)
+- `bash run_DreamStory_kv_cache.sh`
+
+### IR-Diffusion Mode with KV-Cache (memory-efficient)
+- `bash run_IR_Diffusion_kv_cache.sh`
+
+> **Note:** The KV-Cache mode splits the UNet forward pass into a reference pass and a scene pass, significantly reducing peak GPU memory usage while producing equivalent results.
+
 ##  Citation
 🌟 Support Us! If you find this project useful, please consider giving it a ⭐ to help others discover it!
 

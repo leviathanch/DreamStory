@@ -56,6 +56,7 @@ class DreamStoryPipeline(StableDiffusionXLPipeline):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         ref_intermediate_latents = None,
         is_DIFT = None,
+        use_kv_cache = False,
         **kwargs,
     ):
         callback = kwargs.pop("callback", None)
@@ -259,15 +260,21 @@ class DreamStoryPipeline(StableDiffusionXLPipeline):
                 if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
                     added_cond_kwargs["image_embeds"] = image_embeds
 
-                noise_pred = self.unet(
-                    latent_model_input,
-                    t,
-                    encoder_hidden_states=prompt_embeds,
-                    timestep_cond=timestep_cond,
-                    cross_attention_kwargs=self.cross_attention_kwargs,
-                    added_cond_kwargs=added_cond_kwargs,
-                    return_dict=False,
-                )[0]
+                if use_kv_cache:
+                    noise_pred = self._kv_cache_unet_forward(
+                        latents=latents, t=t, prompt_embeds=prompt_embeds,
+                        timestep_cond=timestep_cond, added_cond_kwargs=added_cond_kwargs,
+                    )
+                else:
+                    noise_pred = self.unet(
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep_cond=timestep_cond,
+                        cross_attention_kwargs=self.cross_attention_kwargs,
+                        added_cond_kwargs=added_cond_kwargs,
+                        return_dict=False,
+                    )[0]
 
                 # perform guidance
                 if self.do_classifier_free_guidance:
@@ -347,15 +354,23 @@ class DreamStoryPipeline(StableDiffusionXLPipeline):
                         added_cond_kwargs["image_embeds"] = image_embeds
                     dift_cross_attention_kwargs = self.cross_attention_kwargs.copy() if self.cross_attention_kwargs is not None else {}
                     dift_cross_attention_kwargs["DIFT_sim"] = dift_sim_dict
-                    noise_pred = self.unet(
-                        latent_model_input,
-                        t,
-                        encoder_hidden_states=prompt_embeds,
-                        timestep_cond=timestep_cond,
-                        cross_attention_kwargs=dift_cross_attention_kwargs,
-                        added_cond_kwargs=added_cond_kwargs,
-                        return_dict=False,
-                    )[0]
+
+                    if use_kv_cache:
+                        noise_pred = self._kv_cache_unet_forward(
+                            latents=dift_latents, t=t, prompt_embeds=prompt_embeds,
+                            timestep_cond=timestep_cond, added_cond_kwargs=added_cond_kwargs,
+                            cross_attention_kwargs_override=dift_cross_attention_kwargs,
+                        )
+                    else:
+                        noise_pred = self.unet(
+                            latent_model_input,
+                            t,
+                            encoder_hidden_states=prompt_embeds,
+                            timestep_cond=timestep_cond,
+                            cross_attention_kwargs=dift_cross_attention_kwargs,
+                            added_cond_kwargs=added_cond_kwargs,
+                            return_dict=False,
+                        )[0]
 
                     # perform guidance
                     if self.do_classifier_free_guidance:
@@ -446,6 +461,89 @@ class DreamStoryPipeline(StableDiffusionXLPipeline):
             return (image,)
 
         return StableDiffusionXLPipelineOutput(images=image)
+
+    def _kv_cache_unet_forward(self, latents, t, prompt_embeds, timestep_cond,
+                                added_cond_kwargs, cross_attention_kwargs_override=None):
+        """
+        KV-Cache: split a single UNet forward into reference pass + scene pass.
+
+        Original batch structure (CFG enabled, N subjects):
+          latents: [s1, s2, ..., sN, scene]  shape (N+1, C, H, W)
+          prompt_embeds: [neg_s1..neg_scene, pos_s1..pos_scene]  shape (2*(N+1), seq, dim)
+
+        Reference pass: batch = 2*N (uncond + cond for N subjects)
+        Scene pass:     batch = 2   (uncond + cond for 1 scene)
+        Peak batch reduced from 2*(N+1) to max(2*N, 2).
+        """
+        ca_kwargs = cross_attention_kwargs_override or self.cross_attention_kwargs
+
+        attn_processor = list(self.unet.attn_processors.values())[0]
+
+        # Split latents: [s1..sN] and [scene]
+        ref_latents = latents[:-1]     # (N, C, H, W)
+        scene_latents = latents[-1:]   # (1, C, H, W)
+        N = ref_latents.shape[0]
+
+        # Split prompt_embeds: [neg_s1..neg_scene, pos_s1..pos_scene]
+        neg_embeds, pos_embeds = prompt_embeds.chunk(2, dim=0)
+        ref_prompt_embeds = torch.cat([neg_embeds[:N], pos_embeds[:N]], dim=0)
+        scene_prompt_embeds = torch.cat([neg_embeds[N:], pos_embeds[N:]], dim=0)
+
+        # Split add_text_embeds
+        add_text_embeds = added_cond_kwargs["text_embeds"]
+        neg_text_emb, pos_text_emb = add_text_embeds.chunk(2, dim=0)
+        ref_text_embeds = torch.cat([neg_text_emb[:N], pos_text_emb[:N]], dim=0)
+        scene_text_embeds = torch.cat([neg_text_emb[N:], pos_text_emb[N:]], dim=0)
+
+        # Split add_time_ids
+        add_time_ids = added_cond_kwargs["time_ids"]
+        neg_time_ids, pos_time_ids = add_time_ids.chunk(2, dim=0)
+        ref_time_ids = torch.cat([neg_time_ids[:N], pos_time_ids[:N]], dim=0)
+        scene_time_ids = torch.cat([neg_time_ids[N:], pos_time_ids[N:]], dim=0)
+
+        # === Reference pass ===
+        attn_processor.set_reference_pass(True)
+        ref_input = torch.cat([ref_latents] * 2)  # (2*N, C, H, W)
+        ref_input = self.scheduler.scale_model_input(ref_input, t)
+        ref_added_cond = {"text_embeds": ref_text_embeds, "time_ids": ref_time_ids}
+        if "image_embeds" in added_cond_kwargs:
+            ref_added_cond["image_embeds"] = added_cond_kwargs["image_embeds"]
+
+        ref_noise_pred = self.unet(
+            ref_input, t,
+            encoder_hidden_states=ref_prompt_embeds,
+            timestep_cond=timestep_cond,
+            cross_attention_kwargs=ca_kwargs,
+            added_cond_kwargs=ref_added_cond,
+            return_dict=False,
+        )[0]
+
+        # === Scene pass ===
+        attn_processor.set_reference_pass(False)
+        scene_input = torch.cat([scene_latents] * 2)  # (2, C, H, W)
+        scene_input = self.scheduler.scale_model_input(scene_input, t)
+        scene_added_cond = {"text_embeds": scene_text_embeds, "time_ids": scene_time_ids}
+        if "image_embeds" in added_cond_kwargs:
+            scene_added_cond["image_embeds"] = added_cond_kwargs["image_embeds"]
+
+        scene_noise_pred = self.unet(
+            scene_input, t,
+            encoder_hidden_states=scene_prompt_embeds,
+            timestep_cond=timestep_cond,
+            cross_attention_kwargs=ca_kwargs,
+            added_cond_kwargs=scene_added_cond,
+            return_dict=False,
+        )[0]
+
+        # === Merge: restore [s1_u..scene_u, s1_c..scene_c] structure ===
+        ref_uncond, ref_cond = ref_noise_pred.chunk(2, dim=0)
+        scene_uncond, scene_cond = scene_noise_pred.chunk(2, dim=0)
+        noise_pred = torch.cat([ref_uncond, scene_uncond, ref_cond, scene_cond], dim=0)
+
+        # Clean up cache for this step
+        attn_processor.clear_kv_cache()
+
+        return noise_pred
     
     @torch.no_grad()
     def get_DIFT_feature(self, latents, prompt_embeds, added_cond_kwargs,
