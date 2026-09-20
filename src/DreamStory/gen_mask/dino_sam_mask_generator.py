@@ -232,10 +232,14 @@ def _dino_predict_transformers(
     # transformers returns logits: [batch, num_queries, num_classes] and
     # pred_boxes: [batch, num_queries, 4] (normalized cxcywh).
     target_sizes = torch.tensor([image_pil.size[::-1]], device=device)  # [H, W]
+    # The current transformers API exposes a single 'threshold' kwarg (which
+    # gates box confidence) plus 'text_threshold' (which gates the per-class
+    # logits). The legacy groundingdino API used 'box_threshold' for the
+    # former — we map the caller's box_threshold onto threshold.
     results = processor.post_process_grounded_object_detection(
         outputs=outputs,
         input_ids=inputs["input_ids"],
-        box_threshold=box_threshold,
+        threshold=box_threshold,
         text_threshold=text_threshold,
         target_sizes=target_sizes,
     )[0]
