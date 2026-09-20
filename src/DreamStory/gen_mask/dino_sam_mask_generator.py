@@ -248,6 +248,22 @@ def _dino_predict_transformers(
     scores = results["scores"]          # [N]
     phrases = results["text_labels"]    # list[str] of length N
 
+    # transformers' post_process_grounded_object_detection emits a single
+    # dash "-" as a placeholder for boxes where no token survived the
+    # text_threshold filter. The downstream NMS / class-merge logic
+    # (the legacy box-merging block) can't handle "-" because
+    # get_key_from_prompts asserts len(phrase) > 1. Filter them out
+    # here so callers see only meaningful phrases.
+    keep = [i for i, p in enumerate(phrases) if p and p.strip() not in ("", "-")]
+    if keep:
+        boxes = boxes[keep]
+        scores = scores[keep]
+        phrases = [phrases[i] for i in keep]
+    else:
+        boxes = boxes.new_zeros((0, 4))
+        scores = scores.new_zeros((0,))
+        phrases = []
+
     return boxes.detach().cpu(), scores.detach().cpu(), phrases
 
 
