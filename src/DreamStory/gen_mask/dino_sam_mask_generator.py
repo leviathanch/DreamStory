@@ -163,7 +163,13 @@ def load_model(
 
 
 def get_key_from_prompts(text, phrase, count=0):
-    assert phrase is not None and len(phrase) > 1, f"phrase should not be None or empty, but got {phrase}"
+    # Defensive: transformers' GroundingDinoProcessor can return single-char
+    # placeholder phrases ("-") or empty strings for low-confidence boxes.
+    # The legacy groundingdino-py never emitted these. If we see one, we
+    # just return None — the caller's existing "if class_name_i == class_name_j"
+    # checks treat None as a non-match and the box-merging logic falls through.
+    if phrase is None or len(phrase) <= 1 or phrase.strip() in ("", "-"):
+        return None
     class_name = text.split(".")
     class_name = [name.strip() for name in class_name if name.strip()]
     if count > 10:
